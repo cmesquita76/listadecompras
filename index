@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Lista de Compras Inteligente</title>
+    
+    <!-- Configurações PWA (Instalável na Tela Inicial) -->
+    <meta name="theme-color" content="#4f46e5">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Lista AI">
+    
+    <link rel="manifest" href='data:application/manifest+json,{"name":"Lista de Compras Inteligente","short_name":"Lista AI","start_url":".","display":"standalone","background_color":"#f8fafc","theme_color":"#4f46e5"}'>
+
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: { sans: ['Inter', 'sans-serif'] },
+                    colors: { primary: { 50: '#f0f9ff', 100: '#e0f2fe', 500: '#0ea5e9', 600: '#0284c7', 900: '#0c4a6e' } }
+                }
+            }
+        }
+    </script>
+
+    <style type="text/css">
+        body { background-color: #f8fafc; color: #0f172a; -webkit-tap-highlight-color: transparent; }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        .btn-active:active { transform: scale(0.96); opacity: 0.9; transition: all 0.1s; }
+        .glass { background-color: rgba(255, 255, 255, 0.85); backdrop-filter: blur(12px); border-bottom: 1px solid rgba(0,0,0,0.05); }
+        
+        /* Classes auxiliares para Drag & Drop nativo */
+        .cursor-grab { cursor: -webkit-grab; cursor: grab; }
+        .cursor-grabbing { cursor: -webkit-grabbing; cursor: grabbing; }
+        .drag-ghost { opacity: 0.4; background-color: #f1f5f9; border: 2px dashed #cbd5e1; }
+    </style>
+
+    <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.2.0",
+        "react-dom": "https://esm.sh/react-dom@18.2.0",
+        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+        "htm": "https://esm.sh/htm@3.1.1",
+        "lucide-react": "https://esm.sh/lucide-react@0.344.0",
+        "clsx": "https://esm.sh/clsx@2.1.0",
+        "tailwind-merge": "https://esm.sh/tailwind-merge@2.2.1",
+        "sortablejs": "https://esm.sh/sortablejs@1.15.2"
+      }
+    }
+    </script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="module">
+        import React, { useState, useEffect, useMemo, useRef } from 'react';
+        import { createRoot } from 'react-dom/client';
+        import htm from 'htm';
+        import * as Lucide from 'lucide-react';
+        import { clsx } from 'clsx';
+        import { twMerge } from 'tailwind-merge';
+        import Sortable from 'sortablejs';
+
+        const html = htm.bind(React.createElement);
+        function cn(...inputs) { return twMerge(clsx(inputs)); }
+        const generateId = () => Math.random().toString(36).substring(2, 15);
+
+        // --- COMPONENTE ROBUSTO DE ARRASTAR E SOLTAR (SORTABLEJS) ---
+        const SortableList = ({ items, onSort, renderItem, className, dragHandle }) => {
+            const listRef = useRef(null);
+            const onSortRef = useRef(onSort);
+            
+            // Mantém a referência da função atualizada sem re-engatilhar o useEffect
+            useEffect(() => { onSortRef.current = onSort; }, [onSort]);
+
+            useEffect(() => {
+                if (!listRef.current) return;
+                const sortable = new Sortable(listRef.current, {
+                    handle: dragHandle,
+                    animation: 150,
+                    ghostClass: 'drag-ghost',
+                    forceFallback: true, // Melhora a física em alguns dispositivos móveis
+                    fallbackClass: 'shadow-2xl',
+                    onEnd: (evt) => {
+                        const { oldIndex, newIndex, item, from } = evt;
+                        if (oldIndex === newIndex) return;
+                        
+                        // Passo crítico: Reverter o DOM para evitar que o React perca o nó virtual
+                        item.remove();
+                        const sibling = from.children[oldIndex];
+                        if (sibling) {
+                            from.insertBefore(item, sibling);
+                        } else {
+                            from.appendChild(item);
+                        }
+                        
+                        // Atualiza o estado real
+                        onSortRef.current(oldIndex, newIndex);
+                    }
+                });
+                return () => sortable.destroy();
+            }, [dragHandle]);
+
+            return html`
+                <div ref=${listRef} className=${className}>
+                    ${items.map((item, index) => renderItem(item, index))}
+                </div>
+            `;
+        };
+
+        // --- GEMINI SERVICE API ---
+        async function fetchWithRetry(url, options, retries = 3) {
+            const delays = [1000, 2000, 4000];
+            for (let i = 0; i < retries; i++) {
+                try {
+                    const res = await fetch(url, options);
+                    if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+                    return await res.json();
+                } catch (err) {
+                    if (i === retries - 1) throw err;
+                    await new Promise(r => setTimeout(r, delays[i]));
+                }
+            }
+        }
+
+        const analyzePriceWithAI = async (imageB64, mimeType, userApiKey) => {
+            if (!userApiKey) throw new Error("API Key não configurada. Acesse as configurações (engrenagem).");
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${userApiKey}`;
+            
+            const prompt = `
+            Você é um assistente de compras experiente. Analise a imagem da etiqueta ou do produto.
+            Extraia as seguintes informações e retorne ESTRITAMENTE um JSON:
+            {
+                "produto": "Nome e marca do produto",
+                "precoTotal": 10.50,
+                "quantidadeNaEmbalagem": 500,
+                "unidadeMedida": "g"
+            }
+            Se não encontrar algo, deduza ou coloque null, mas mantenha o formato numérico correto para cálculos. Sem markdown.`;
+            
+            const payload = {
+                contents: [{ role: "user", parts: [ { text: prompt }, { inlineData: { mimeType: mimeType, data: imageB64 } } ] }],
+                generationConfig: { responseMimeType: "application/json" }
+            };
+
+            const data = await fetchWithRetry(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+            const responseText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!responseText) throw new Error("IA não conseguiu ler a imagem.");
+            
+            const cleanText = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
+            return JSON.parse(cleanText);
+        };
+
+        // --- DATA STRUCTURES ---
+        const initialData = { categorias: [] };
+        const catColors = [
+            { bg: 'bg-blue-500', text: 'text-blue-700', borderL: 'border-l-blue-500' },
+            { bg: 'bg-rose-500', text: 'text-rose-700', borderL: 'border-l-rose-500' },
+            { bg: 'bg-emerald-500', text: 'text-emerald-700', borderL: 'border-l-emerald-500' },
+            { bg: 'bg-amber-500', text: 'text-amber-700', borderL: 'border-l-amber-500' },
+            { bg: 'bg-purple-500', text: 'text-purple-700', borderL: 'border-l-purple-500' },
+        ];
+        const getCatColor = (idx) => catColors[idx % catColors.length];
+
+        const App = () => {
+            const [list, setList] = useState(() => {
+                try { return JSON.parse(localStorage.getItem('app_list_v2')) || initialData; } 
+                catch(e) { return initialData; }
+            });
+            const [activeTab, setActiveTab] = useState('lista');
+            
+            // App Config State
+            const [apiKey, setApiKey] = useState(() => localStorage.getItem('user_api_key') || '');
+            const [showSettings, setShowSettings] = useState(false);
+
+            const [filter, setFilter] = useState('todos');
+            const [isEditingMode, setIsEditingMode] = useState(false);
+            const [isAddingItem, setIsAddingItem] = useState(false);
+            
+            const [compItemA, setCompItemA] = useState(null);
+            const [compItemB, setCompItemB] = useState(null);
+            const [activeSlot, setActiveSlot] = useState(null);
+            
+            const [isLoading, setIsLoading] = useState(false);
+            const [message, setMessage] = useState(null);
+            const fileInputRef = useRef(null);
+
+            useEffect(() => { localStorage.setItem('app_list_v2', JSON.stringify(list)); }, [list]);
+            useEffect(() => { localStorage.setItem('user_api_key', apiKey); }, [apiKey]);
+
+            const showMsg = (text, type = 'error') => {
+                setMessage({ text, type });
+                setTimeout(() => setMessage(null), 4000);
+            };
+
+            const toggleEditMode = () => {
+                if (!isEditingMode) setFilter('todos'); // Bloqueia filtro para não corromper o índice durante a reordenação
+                setIsEditingMode(!isEditingMode);
+            };
+
+            const normalizeUnit = (qtd, unit) => {
+                let normalizedQtd = qtd;
+                let normalizedUnit = unit;
+                if (unit === 'g') { normalizedQtd = qtd / 1000; normalizedUnit = 'kg'; }
+                if (unit === 'ml') { normalizedQtd = qtd / 1000; normalizedUnit = 'L'; }
+                return { qtd: normalizedQtd, unit: normalizedUnit };
+            };
+
+            const getComparisonResult = () => {
+                if (!compItemA || !compItemB) return null;
+                if (!compItemA.precoTotal || !compItemB.precoTotal) return null;
+
+                const normA = normalizeUnit(compItemA.quantidadeNaEmbalagem, compItemA.unidadeMedida);
+                const normB = normalizeUnit(compItemB.quantidadeNaEmbalagem, compItemB.unidadeMedida);
+
+                const precoPorUnidadeA = compItemA.precoTotal / normA.qtd;
+                const precoPorUnidadeB = compItemB.precoTotal / normB.qtd;
+
+                const diff = Math.abs(precoPorUnidadeA - precoPorUnidadeB);
+                const pct = (diff / Math.max(precoPorUnidadeA, precoPorUnidadeB)) * 100;
+                
+                let winner = null;
+                if (precoPorUnidadeA < precoPorUnidadeB) winner = 'A';
+                else if (precoPorUnidadeB < precoPorUnidadeA) winner = 'B';
+
+                return { winner, pct: pct.toFixed(1), unitA: normA.unit, unitB: normB.unit, precoUnidA: precoPorUnidadeA, precoUnidB: precoPorUnidadeB };
+            };
+
+            const comparison = getComparisonResult();
+
+            const handleCameraCapture = async (e) => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+                
+                if (!apiKey) {
+                    showMsg("Por favor, configure sua API Key nas configurações primeiro.");
+                    setShowSettings(true);
+                    return;
+                }
+
+                setIsLoading(true);
+                try {
+                    const reader = new FileReader();
+                    reader.onloadend = async () => {
+                        try {
+                            const base64 = reader.result.split(',')[1];
+                            const result = await analyzePriceWithAI(base64, file.type, apiKey);
+                            
+                            if (activeTab === 'comparador') {
+                                if (activeSlot === 'A') setCompItemA(result);
+                                else if (activeSlot === 'B') setCompItemB(result);
+                                setActiveSlot(null);
+                            } else {
+                                addItem('Geral', { 
+                                    nome: result.produto, 
+                                    quantidade: 1, 
+                                    unidade: 'un', 
+                                    observacao: `Preço ref: R$ ${result.precoTotal}` 
+                                });
+                                showMsg("Item escaneado e adicionado!", "success");
+                            }
+                        } catch (err) {
+                            showMsg("Não foi possível ler a etiqueta. " + err.message);
+                        } finally {
+                            setIsLoading(false);
+                            if(fileInputRef.current) fileInputRef.current.value = '';
+                        }
+                    };
+                    reader.readAsDataURL(file);
+                } catch (error) {
+                    showMsg("Erro no arquivo da câmera.");
+                    setIsLoading(false);
+                }
+            };
+
+            const triggerCameraForSlot = (slot) => {
+                setActiveSlot(slot);
+                fileInputRef.current?.click();
+            };
+
+            // --- FUNÇÕES DE REORDENAÇÃO ---
+            const handleSortCategories = (oldIndex, newIndex) => {
+                const newList = JSON.parse(JSON.stringify(list));
+                const [moved] = newList.categorias.splice(oldIndex, 1);
+                newList.categorias.splice(newIndex, 0, moved);
+                setList(newList);
+            };
+
+            const handleSortItems = (catNome, oldIndex, newIndex) => {
+                const newList = JSON.parse(JSON.stringify(list));
+                const cat = newList.categorias.find(c => c.nome === catNome);
+                if(cat) {
+                    const [moved] = cat.itens.splice(oldIndex, 1);
+                    cat.itens.splice(newIndex, 0, moved);
+                    setList(newList);
+                }
+            };
+
+            // --- MUTADORES GERAIS ---
+            const toggleItem = (catNome, itemId) => {
+                const newList = JSON.parse(JSON.stringify(list));
+                const cat = newList.categorias.find(c => c.nome === catNome);
+                if (cat) {
+                    const item = cat.itens.find(i => i.id === itemId);
+                    if (item) item.comprado = !item.comprado;
+                }
+                setList(newList);
+            };
+
+            const removeItem = (catNome, itemId) => {
+                const newList = JSON.parse(JSON.stringify(list));
+                const catIdx = newList.categorias.findIndex(c => c.nome === catNome);
+                if (catIdx > -1) {
+                    newList.categorias[catIdx].itens = newList.categorias[catIdx].itens.filter(i => i.id !== itemId);
+                    if (newList.categorias[catIdx].itens.length === 0) newList.categorias.splice(catIdx, 1);
+                    setList(newList);
+                }
+            };
+
+            const addItem = (catName, newItem) => {
+                const newList = JSON.parse(JSON.stringify(list));
+                if (!newList.categorias) newList.categorias = [];
+                let cat = newList.categorias.find(c => c.nome === catName);
+                if (!cat) {
+                    cat = { nome: catName, itens: [] };
+                    newList.categorias.push(cat);
+                }
+                cat.itens.push({
+                    id: generateId(),
+                    nome: newItem.nome || 'Novo Item',
+                    quantidade: newItem.quantidade || 1,
+                    unidade: newItem.unidade || 'un',
+                    observacao: newItem.observacao || '',
+                    comprado: false
+                });
+                setList(newList);
+                setIsAddingItem(false);
+            };
+
+            const filteredList = useMemo(() => {
+                if(!list.categorias) return { categorias: [] };
+                return {
+                    categorias: list.categorias.map(cat => ({
+                        ...cat,
+                        itens: cat.itens.filter(item => filter === 'todos' || (filter === 'faltantes' && !item.comprado) || (filter === 'comprados' && item.comprado))
+                    })).filter(cat => cat.itens.length > 0)
+                };
+            }, [list, filter]);
+
+            return html`
+                <div className="max-w-md mx-auto min-h-screen flex flex-col relative bg-slate-50 font-sans">
+                    
+                    ${message && html`
+                        <div className=${cn("fixed top-4 left-1/2 -translate-x-1/2 w-[90%] max-w-sm text-white px-4 py-3 rounded-2xl shadow-xl z-50 flex items-center justify-between transition-all", message.type === 'error' ? 'bg-rose-600' : 'bg-emerald-600')}>
+                            <span className="text-sm font-semibold">${message.text}</span>
+                            <button onClick=${() => setMessage(null)} className="p-1 opacity-80 hover:opacity-100"><${Lucide.X} size=${16} /></button>
+                        </div>
+                    `}
+
+                    <input type="file" ref=${fileInputRef} className="hidden" onChange=${handleCameraCapture} accept="image/*" capture="environment" />
+
+                    <header className="sticky top-0 z-40 glass px-4 pt-6 pb-4">
+                        <div className="flex items-center justify-between mb-6">
+                            <div className="flex items-center gap-3">
+                                <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center text-white shadow-md">
+                                    <${Lucide.ScanLine} size=${22} />
+                                </div>
+                                <h1 className="text-2xl font-extrabold tracking-tight text-slate-800">SmartList</h1>
+                            </div>
+                            <button onClick=${() => setShowSettings(true)} className="p-2 bg-slate-100 text-slate-500 rounded-xl hover:bg-slate-200 transition-colors btn-active">
+                                <${Lucide.Settings} size=${20} />
+                            </button>
+                        </div>
+                        
+                        <div className="flex bg-slate-200/60 p-1 rounded-xl">
+                            <button onClick=${() => setActiveTab('lista')} className=${cn("flex-1 py-2 rounded-lg text-sm font-bold transition-all btn-active", activeTab === 'lista' ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500 hover:text-slate-700")}>
+                                Minha Lista
+                            </button>
+                            <button onClick=${() => setActiveTab('comparador')} className=${cn("flex-1 py-2 rounded-lg text-sm font-bold transition-all btn-active flex justify-center items-center gap-2", activeTab === 'comparador' ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500 hover:text-slate-700")}>
+                                Comparador
+                            </button>
+                        </div>
+                    </header>
+
+                    <main className="flex-1 px-4 pb-32 pt-2">
+                        ${isLoading && html`
+                            <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm">
+                                <div className="bg-white p-6 rounded-3xl shadow-2xl flex flex-col items-center">
+                                    <${Lucide.Loader2} className="animate-spin text-indigo-600 mb-3" size=${36} />
+                                    <p className="font-bold text-slate-800">Lendo etiqueta...</p>
+                                </div>
+                            </div>
+                        `}
+
+                        ${activeTab === 'comparador' && html`
+                            <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4">
+                                <div className="bg-gradient-to-br from-indigo-500 to-indigo-700 p-5 rounded-3xl text-white shadow-lg shadow-indigo-200/50">
+                                    <h2 className="font-extrabold text-lg flex items-center gap-2 mb-2"><${Lucide.Scale} size=${20}/> Qual vale mais a pena?</h2>
+                                    <p className="text-indigo-100 text-sm leading-tight">Mire a câmera na etiqueta para descobrir qual produto tem o melhor custo.</p>
+                                </div>
+
+                                <div className="grid grid-cols-2 gap-3">
+                                    <div className=${cn("border-2 rounded-3xl p-4 flex flex-col items-center justify-center text-center transition-all relative overflow-hidden", compItemA ? "border-indigo-200 bg-indigo-50" : "border-dashed border-slate-300 bg-white")}>
+                                        ${comparison?.winner === 'A' && html`<div className="absolute top-0 left-0 right-0 bg-emerald-500 text-white text-[10px] font-bold py-1 uppercase tracking-wider">Mais Barato</div>`}
+                                        ${compItemA ? html`
+                                            <div className=${cn("w-full mt-3", comparison?.winner === 'A' ? "mt-4" : "")}>
+                                                <p className="font-bold text-slate-800 text-sm leading-tight mb-2 h-10 overflow-hidden">${compItemA.produto}</p>
+                                                <p className="text-2xl font-black text-indigo-700 mb-1">R$ ${compItemA.precoTotal?.toFixed(2)}</p>
+                                                <p className="text-xs text-slate-500 font-medium bg-white py-1 rounded-lg border border-indigo-100">${compItemA.quantidadeNaEmbalagem}${compItemA.unidadeMedida}</p>
+                                                <button onClick=${() => setCompItemA(null)} className="mt-3 text-xs text-rose-500 font-bold w-full py-2 hover:bg-rose-50 rounded-xl transition-colors">Limpar</button>
+                                            </div>
+                                        ` : html`
+                                            <button onClick=${() => triggerCameraForSlot('A')} className="w-full h-32 flex flex-col items-center justify-center gap-2 text-slate-400 hover:text-indigo-600 transition-colors btn-active">
+                                                <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-1"><${Lucide.Camera} size=${24} /></div>
+                                                <span className="font-bold text-sm">Escanear Produto A</span>
+                                            </button>
+                                        `}
+                                    </div>
+                                    <div className=${cn("border-2 rounded-3xl p-4 flex flex-col items-center justify-center text-center transition-all relative overflow-hidden", compItemB ? "border-indigo-200 bg-indigo-50" : "border-dashed border-slate-300 bg-white")}>
+                                        ${comparison?.winner === 'B' && html`<div className="absolute top-0 left-0 right-0 bg-emerald-500 text-white text-[10px] font-bold py-1 uppercase tracking-wider">Mais Barato</div>`}
+                                        ${compItemB ? html`
+                                            <div className=${cn("w-full mt-3", comparison?.winner === 'B' ? "mt-4" : "")}>
+                                                <p className="font-bold text-slate-800 text-sm leading-tight mb-2 h-10 overflow-hidden">${compItemB.produto}</p>
+                                                <p className="text-2xl font-black text-indigo-700 mb-1">R$ ${compItemB.precoTotal?.toFixed(2)}</p>
+                                                <p className="text-xs text-slate-500 font-medium bg-white py-1 rounded-lg border border-indigo-100">${compItemB.quantidadeNaEmbalagem}${compItemB.unidadeMedida}</p>
+                                                <button onClick=${() => setCompItemB(null)} className="mt-3 text-xs text-rose-500 font-bold w-full py-2 hover:bg-rose-50 rounded-xl transition-colors">Limpar</button>
+                                            </div>
+                                        ` : html`
+                                            <button onClick=${() => triggerCameraForSlot('B')} className="w-full h-32 flex flex-col items-center justify-center gap-2 text-slate-400 hover:text-indigo-600 transition-colors btn-active">
+                                                <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-1"><${Lucide.Camera} size=${24} /></div>
+                                                <span className="font-bold text-sm">Escanear Produto B</span>
+                                            </button>
+                                        `}
+                                    </div>
+                                </div>
+                                ${comparison && html`
+                                    <div className="bg-emerald-50 border border-emerald-200 rounded-3xl p-5 text-center shadow-sm">
+                                        <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-emerald-100 text-emerald-600 mb-3">
+                                            <${Lucide.TrendingDown} size=${24} strokeWidth=${3} />
+                                        </div>
+                                        <h3 className="text-emerald-800 font-black text-xl mb-1">Produto ${comparison.winner} é ${comparison.pct}% mais barato!</h3>
+                                        <div className="flex justify-center gap-4 mt-4 text-xs font-medium text-emerald-700/80 bg-white/50 py-2 rounded-xl">
+                                            <p>A: R$ ${comparison.precoUnidA.toFixed(2)} / ${comparison.unitA}</p>
+                                            <p>B: R$ ${comparison.precoUnidB.toFixed(2)} / ${comparison.unitB}</p>
+                                        </div>
+                                    </div>
+                                `}
+                            </div>
+                        `}
+
+                        ${activeTab === 'lista' && html`
+                            <div className="animate-in fade-in slide-in-from-bottom-4">
+                                <div className="flex items-center justify-between mb-4">
+                                    <div className="flex gap-2">
+                                        ${['todos', 'faltantes'].map((f) => html`
+                                            <button key=${f} disabled=${isEditingMode} onClick=${() => setFilter(f)} className=${cn("px-4 py-2 rounded-xl text-sm font-bold capitalize transition-colors btn-active", filter === f ? "bg-indigo-600 text-white shadow-md" : "bg-white text-slate-500 border border-slate-200", isEditingMode && "opacity-50 cursor-not-allowed")}>
+                                                ${f}
+                                            </button>
+                                        `)}
+                                    </div>
+                                    <button onClick=${toggleEditMode} className=${cn("flex items-center gap-2 px-3 py-2 rounded-xl border transition-colors btn-active font-bold text-sm", isEditingMode ? "bg-indigo-600 text-white border-indigo-600 shadow-md" : "bg-white text-slate-600 border-slate-200")}>
+                                        <${Lucide.ListOrdered} size=${18} />
+                                        ${isEditingMode ? 'Concluir' : 'Organizar'}
+                                    </button>
+                                </div>
+
+                                ${list.categorias.length === 0 && html`
+                                    <div className="text-center py-16 text-slate-400">
+                                        <div className="w-20 h-20 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                                            <${Lucide.ShoppingBasket} size=${32} className="text-slate-300" />
+                                        </div>
+                                        <p className="font-semibold text-slate-500">Sua lista está vazia</p>
+                                        <p className="text-sm mt-1">Adicione itens manualmente ou escaneie etiquetas.</p>
+                                    </div>
+                                `}
+
+                                ${isEditingMode ? html`
+                                    <div className="mb-4 text-xs font-semibold text-indigo-600 bg-indigo-50 border border-indigo-100 px-4 py-3 rounded-xl flex items-center gap-2 shadow-sm">
+                                        <${Lucide.Info} size=${16} className="flex-shrink-0" />
+                                        <span>Toque e segure nos ícones laterais para arrastar grupos ou itens.</span>
+                                    </div>
+                                    
+                                    <${SortableList} 
+                                        items=${list.categorias}
+                                        onSort=${handleSortCategories}
+                                        dragHandle=".cat-handle"
+                                        className="space-y-6 pb-6"
+                                        renderItem=${(cat, catIdx) => {
+                                            const catColor = getCatColor(catIdx);
+                                            return html`
+                                                <div key=${cat.nome} className="relative bg-white rounded-3xl p-3 border border-slate-200 shadow-sm">
+                                                    <div className="flex items-center gap-3 mb-4 px-1">
+                                                        <div className="cat-handle cursor-grab active:cursor-grabbing touch-none p-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-500 transition-colors"><${Lucide.GripVertical} size=${20} /></div>
+                                                        <h2 className=${cn("text-sm font-black uppercase tracking-widest flex items-center gap-2", catColor.text)}>
+                                                            <span className=${cn("w-3 h-3 rounded-full", catColor.bg)}></span>
+                                                            ${cat.nome}
+                                                        </h2>
+                                                    </div>
+                                                    
+                                                    <div className="pl-12 pr-1 pb-1">
+                                                        <${SortableList}
+                                                            items=${cat.itens}
+                                                            onSort=${(o, n) => handleSortItems(cat.nome, o, n)}
+                                                            dragHandle=".item-handle"
+                                                            className="space-y-2"
+                                                            renderItem=${(item) => html`
+                                                                <div key=${item.id} className=${cn("flex items-center gap-3 p-3 bg-white rounded-2xl border-l-4 border-r border-t border-b border-slate-200 shadow-sm", catColor.borderL)}>
+                                                                    <div className="item-handle cursor-grab active:cursor-grabbing touch-none p-1.5 bg-slate-50 rounded-lg text-slate-400 hover:text-slate-600 transition-colors"><${Lucide.GripVertical} size=${18} /></div>
+                                                                    <div className="flex-1 min-w-0">
+                                                                        <h3 className="font-bold text-slate-800 text-sm leading-tight truncate">${item.nome}</h3>
+                                                                    </div>
+                                                                    <button onClick=${() => removeItem(cat.nome, item.id)} className="p-2 bg-rose-50 text-rose-500 rounded-xl hover:bg-rose-100 transition-colors btn-active">
+                                                                        <${Lucide.Trash2} size=${16} />
+                                                                    </button>
+                                                                </div>
+                                                            `}
+                                                        />
+                                                    </div>
+                                                </div>
+                                            `;
+                                        }}
+                                    />
+                                ` : html`
+                                    ${filteredList.categorias.map((cat, catIdx) => {
+                                        const catColor = getCatColor(catIdx);
+                                        return html`
+                                        <section key=${cat.nome} className="mb-6">
+                                            <div className="flex items-center justify-between mb-3 px-1">
+                                                <h2 className=${cn("text-xs font-black uppercase tracking-widest flex items-center gap-2", catColor.text)}>
+                                                    <span className=${cn("w-2 h-2 rounded-full", catColor.bg)}></span>
+                                                    ${cat.nome}
+                                                </h2>
+                                            </div>
+                                            <div className="space-y-2">
+                                                ${cat.itens.map((item) => html`
+                                                    <div key=${item.id} className=${cn("group flex items-center gap-3 p-3.5 bg-white rounded-2xl border-l-4 transition-all duration-200 shadow-sm", catColor.borderL, item.comprado ? "opacity-50 bg-slate-50 border-r border-t border-b border-slate-100" : "border border-slate-200")}>
+                                                        <button onClick=${() => toggleItem(cat.nome, item.id)} className=${cn("flex-shrink-0 w-6 h-6 rounded-full border-2 flex items-center justify-center btn-active", item.comprado ? "bg-emerald-500 border-emerald-500 text-white" : "border-slate-300")}>
+                                                            ${item.comprado && html`<${Lucide.Check} size=${14} strokeWidth=${3} />`}
+                                                        </button>
+                                                        <div className="flex-1 min-w-0">
+                                                            <h3 className=${cn("font-bold text-slate-800 text-sm leading-tight truncate", item.comprado && "line-through text-slate-400")}>${item.nome}</h3>
+                                                            <div className="flex items-center gap-2 mt-0.5">
+                                                                <span className="text-xs font-semibold text-slate-400 bg-slate-100 px-1.5 py-0.5 rounded">${item.quantidade} ${item.unidade}</span>
+                                                                ${item.observacao && html`<span className="text-[10px] text-slate-400 truncate">${item.observacao}</span>`}
+                                                            </div>
+                                                        </div>
+                                                        <button onClick=${() => removeItem(cat.nome, item.id)} className="opacity-0 group-hover:opacity-100 p-2 text-slate-300 hover:text-rose-500 transition-all rounded-xl btn-active">
+                                                            <${Lucide.Trash2} size=${18} />
+                                                        </button>
+                                                    </div>
+                                                `)}
+                                            </div>
+                                        </section>
+                                        `;
+                                    })}
+                                `}
+                            </div>
+                        `}
+                    </main>
+
+                    <!-- FLOATING BOTTOM BAR -->
+                    <div className="fixed bottom-0 left-0 right-0 p-4 bg-gradient-to-t from-slate-50 via-slate-50/90 to-transparent flex justify-center pb-6">
+                        <div className="w-full max-w-md flex gap-3 px-2">
+                            ${activeTab === 'lista' ? html`
+                                <button onClick=${() => setIsAddingItem(true)} disabled=${isEditingMode} className=${cn("flex-1 h-14 bg-slate-800 text-white rounded-2xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-slate-300 btn-active hover:bg-slate-900 transition-colors", isEditingMode && "opacity-50")}>
+                                    <${Lucide.PenLine} size=${20} /> Digitar Item
+                                </button>
+                                <button onClick=${() => {setActiveTab('comparador'); triggerCameraForSlot('A');}} disabled=${isEditingMode} className=${cn("flex-1 h-14 bg-indigo-600 text-white rounded-2xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-indigo-200 btn-active hover:bg-indigo-700 transition-colors", isEditingMode && "opacity-50")}>
+                                    <${Lucide.Camera} size=${20} /> Escanear Preço
+                                </button>
+                            ` : html`
+                                <button onClick=${() => setActiveTab('lista')} className="w-full h-14 bg-slate-800 text-white rounded-2xl font-bold flex items-center justify-center gap-2 shadow-lg btn-active hover:bg-slate-900 transition-colors">
+                                    <${Lucide.List} size=${20} /> Voltar para a Lista
+                                </button>
+                            `}
+                        </div>
+                    </div>
+
+                    <!-- ADD ITEM MODAL -->
+                    ${isAddingItem && html`
+                        <div className="fixed inset-0 z-50 flex items-end justify-center p-4">
+                            <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" onClick=${() => setIsAddingItem(false)} />
+                            <div className="relative w-full max-w-md bg-white rounded-[32px] p-6 shadow-2xl animate-in slide-in-from-bottom-full duration-200 pb-10">
+                                <h2 className="text-xl font-extrabold text-slate-800 mb-5">Adicionar Manualmente</h2>
+                                <form onSubmit=${(e) => {
+                                    e.preventDefault();
+                                    const fd = new FormData(e.target);
+                                    addItem(fd.get('categoria'), { nome: fd.get('nome'), quantidade: Number(fd.get('quantidade')), unidade: fd.get('unidade'), observacao: fd.get('observacao') });
+                                }} className="space-y-4">
+                                    <div className="space-y-1.5">
+                                        <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-1">Nome do Produto</label>
+                                        <input name="nome" required autoFocus className="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 transition-all font-medium" placeholder="Ex: Arroz Integral" />
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <div className="space-y-1.5">
+                                            <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-1">Quantidade</label>
+                                            <input name="quantidade" type="number" step="0.01" defaultValue="1" className="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:border-indigo-500 font-medium" />
+                                        </div>
+                                        <div className="space-y-1.5">
+                                            <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-1">Unidade</label>
+                                            <select name="unidade" className="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:border-indigo-500 font-medium appearance-none">
+                                                <option value="un">Unidade</option><option value="kg">Quilograma (kg)</option><option value="g">Grama (g)</option><option value="L">Litro (L)</option><option value="ml">Mililitro (ml)</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                    <div className="space-y-1.5">
+                                        <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-1">Seção / Categoria</label>
+                                        <select name="categoria" className="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:border-indigo-500 font-medium appearance-none">
+                                            <option>Supermercado</option><option>Hortifruti</option><option>Açougue</option><option>Limpeza</option><option>Higiene</option><option>Bebidas</option>
+                                        </select>
+                                    </div>
+                                    
+                                    <div className="pt-4 flex gap-3">
+                                        <button type="button" onClick=${() => setIsAddingItem(false)} className="flex-1 py-4 text-slate-500 font-bold bg-slate-100 rounded-2xl btn-active">Cancelar</button>
+                                        <button type="submit" className="flex-[2] py-4 bg-indigo-600 text-white font-bold rounded-2xl shadow-lg shadow-indigo-200 btn-active">Salvar Produto</button>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    `}
+
+                    <!-- SETTINGS MODAL -->
+                    ${showSettings && html`
+                        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+                            <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" onClick=${() => setShowSettings(false)} />
+                            <div className="relative w-full max-w-md bg-white rounded-[32px] p-6 shadow-2xl animate-in zoom-in-95 duration-200">
+                                <div className="flex justify-between items-center mb-5">
+                                    <h2 className="text-xl font-extrabold text-slate-800 flex items-center gap-2">
+                                        <${Lucide.Settings} size=${24} className="text-indigo-600" /> Configurações
+                                    </h2>
+                                    <button onClick=${() => setShowSettings(false)} className="p-1.5 bg-slate-100 text-slate-500 rounded-full hover:bg-slate-200 transition-colors">
+                                        <${Lucide.X} size=${20} />
+                                    </button>
+                                </div>
+                                
+                                <div className="space-y-4">
+                                    <div className="bg-indigo-50 border border-indigo-100 p-4 rounded-2xl text-sm text-indigo-800">
+                                        Para usar o scanner de IA gratuitamente, você precisa da sua própria chave do Google AI Studio. 
+                                        <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" className="font-bold underline ml-1 text-indigo-600 hover:text-indigo-900">Pegue a sua aqui.</a>
+                                    </div>
+
+                                    <div className="space-y-1.5">
+                                        <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-1">Google Gemini API Key</label>
+                                        <input 
+                                            type="password" 
+                                            value=${apiKey} 
+                                            onChange=${(e) => setApiKey(e.target.value)} 
+                                            placeholder="Cole sua chave AIzaSy..." 
+                                            className="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl outline-none focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 transition-all font-mono text-sm"
+                                        />
+                                        <p className="text-xs text-slate-400 px-1 mt-1">A chave fica salva apenas no seu celular. Não é enviada para nenhum outro servidor.</p>
+                                    </div>
+                                    
+                                    <button onClick=${() => setShowSettings(false)} className="w-full py-4 mt-4 bg-slate-800 text-white font-bold rounded-2xl shadow-lg shadow-slate-200 btn-active hover:bg-slate-900 transition-colors">
+                                        Salvar e Fechar
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    `}
+                </div>
+            `;
+        };
+
+        const root = createRoot(document.getElementById('root'));
+        root.render(React.createElement(App));
+    </script>
+</body>
+</html>
